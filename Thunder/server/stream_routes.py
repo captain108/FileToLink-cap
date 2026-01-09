@@ -1,3 +1,4 @@
+
 # Thunder/server/stream_routes.py
 
 import re
@@ -15,15 +16,11 @@ from Thunder.utils.logger import logger
 from Thunder.utils.render_template import render_page
 from Thunder.utils.time_format import get_readable_time
 
-# =========================================================
-# IMPORTANT: routes MUST be global (fixes ImportError)
-# =========================================================
 routes = web.RouteTableDef()
 
 SECURE_HASH_LENGTH = 6
 CHUNK_SIZE = 1024 * 1024
 MAX_CONCURRENT_PER_CLIENT = 8
-
 RANGE_REGEX = re.compile(r"bytes=(?P<start>\d*)-(?P<end>\d*)")
 PATTERN_HASH_FIRST = re.compile(
     rf"^([a-zA-Z0-9_-]{{{SECURE_HASH_LENGTH}}})(\d+)(?:/.*)?$")
@@ -39,9 +36,8 @@ CORS_HEADERS = {
 
 streamers = {}
 
-# =========================================================
-# HELPERS
-# =========================================================
+
+# ---------------- HELPERS ----------------
 
 def get_streamer(client_id: int) -> ByteStreamer:
     if client_id not in streamers:
@@ -50,34 +46,29 @@ def get_streamer(client_id: int) -> ByteStreamer:
 
 
 def parse_media_request(path: str, query: dict) -> tuple[int, str]:
-    clean_path = unquote(path).strip("/")
+    clean_path = unquote(path).strip('/')
 
-    m = PATTERN_HASH_FIRST.match(clean_path)
-    if m:
-        return int(m.group(2)), m.group(1)
+    match = PATTERN_HASH_FIRST.match(clean_path)
+    if match:
+        return int(match.group(2)), match.group(1)
 
-    m = PATTERN_ID_FIRST.match(clean_path)
-    if m:
-        return int(m.group(1)), query.get("hash", "").strip()
+    match = PATTERN_ID_FIRST.match(clean_path)
+    if match:
+        return int(match.group(1)), query.get("hash", "").strip()
 
     raise InvalidHash("Invalid URL")
 
 
 def select_optimal_client() -> tuple[int, ByteStreamer]:
     if not work_loads:
-        raise web.HTTPInternalServerError(text="No available clients")
+        raise web.HTTPInternalServerError(text="No clients available")
 
     available = [
         (cid, load) for cid, load in work_loads.items()
         if load < MAX_CONCURRENT_PER_CLIENT
     ]
 
-    client_id = (
-        min(available, key=lambda x: x[1])[0]
-        if available
-        else min(work_loads, key=work_loads.get)
-    )
-
+    client_id = min(available, key=lambda x: x[1])[0] if available else min(work_loads, key=work_loads.get)
     return client_id, get_streamer(client_id)
 
 
@@ -85,21 +76,16 @@ def parse_range_header(range_header: str, file_size: int) -> tuple[int, int]:
     if not range_header:
         return 0, file_size - 1
 
-    m = RANGE_REGEX.match(range_header)
-    if not m:
-        raise web.HTTPBadRequest(text="Invalid Range header")
+    match = RANGE_REGEX.match(range_header)
+    if not match:
+        raise web.HTTPBadRequest()
 
-    start = int(m.group("start") or 0)
-    end = int(m.group("end") or file_size - 1)
+    start = int(match.group("start") or 0)
+    end = int(match.group("end") or file_size - 1)
+    return start, min(end, file_size - 1)
 
-    if start > end or end >= file_size:
-        raise web.HTTPRequestRangeNotSatisfiable()
 
-    return start, end
-
-# =========================================================
-# ROUTES
-# =========================================================
+# ---------------- ROUTES ----------------
 
 @routes.get("/")
 async def root_redirect(request):
@@ -112,52 +98,41 @@ async def status_endpoint(request):
         "server": {
             "status": "operational",
             "version": __version__,
-            "uptime": get_readable_time(time.time() - StartTime),
+            "uptime": get_readable_time(time.time() - StartTime)
         },
         "telegram_bot": {
             "username": f"@{StreamBot.username}",
-            "active_clients": len(multi_clients),
-        },
+            "active_clients": len(multi_clients)
+        }
     })
 
 
 @routes.options(r"/{path:.+}")
 async def options_handler(request):
-    return web.Response(
-        headers={**CORS_HEADERS, "Access-Control-Max-Age": "86400"}
-    )
+    return web.Response(headers={**CORS_HEADERS, "Access-Control-Max-Age": "86400"})
 
-# =========================================================
-# STREAM PAGE
-# =========================================================
+
+# ---------------- STREAM PAGE ----------------
 
 @routes.get(r"/watch/{path:.+}")
 async def media_preview(request: web.Request):
-    try:
-        path = request.match_info["path"]
-        message_id, secure_hash = parse_media_request(path, request.query)
+    path = request.match_info["path"]
+    message_id, secure_hash = parse_media_request(path, request.query)
 
-        html = await render_page(
-            message_id, secure_hash, requested_action="stream"
-        )
+    html = await render_page(message_id, secure_hash, requested_action="stream")
+    return web.Response(
+        text=html,
+        content_type="text/html",
+        headers={"Access-Control-Allow-Origin": "*"}
+    )
 
-        return web.Response(
-            text=html,
-            content_type="text/html",
-            headers={"Access-Control-Allow-Origin": "*"},
-        )
 
-    except Exception:
-        raise web.HTTPNotFound(text="Invalid or expired link")
-
-# =========================================================
-# FILE DELIVERY (DEFAULT PROXY STREAMING)
-# =========================================================
+# ---------------- FILE DELIVERY (FIXED) ----------------
 
 @routes.get(r"/{path:.+}")
 async def media_delivery(request: web.Request):
 
-    # Block HEAD requests (prevents 0B issues)
+    # ❌ Block HEAD (fixes 0B / browser stuck)
     if request.method == "HEAD":
         raise web.HTTPMethodNotAllowed("HEAD", ["GET"])
 
@@ -168,10 +143,12 @@ async def media_delivery(request: web.Request):
     work_loads[client_id] += 1
 
     try:
+        # 🔄 AUTO REFRESH CLIENT (replaces /restart)
         if not streamer.client.is_connected:
             await streamer.client.start()
 
         file_info = await streamer.get_file_info(message_id)
+
         if not file_info or not file_info.get("unique_id"):
             raise FileNotFound("File not found")
 
@@ -195,13 +172,15 @@ async def media_delivery(request: web.Request):
             "Accept-Ranges": "bytes",
             "Cache-Control": "no-store",
             "Access-Control-Allow-Origin": "*",
-            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Content-Range": f"bytes {start}-{end}/{file_size}"
         }
 
         async def stream_generator():
             try:
                 async for chunk in streamer.stream_file(
-                    message_id, offset=start, limit=content_length
+                    message_id,
+                    offset=start,
+                    limit=content_length
                 ):
                     yield chunk
             finally:
@@ -210,7 +189,7 @@ async def media_delivery(request: web.Request):
         return web.Response(
             status=206,
             body=stream_generator(),
-            headers=headers,
+            headers=headers
         )
 
     except Exception as e:
