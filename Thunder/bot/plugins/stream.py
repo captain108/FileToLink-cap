@@ -448,13 +448,14 @@ async def process_single(
                     disable_web_page_preview=True,
                     quote=True
                 )
-        if status_msg:
-            await safe_delete_message(status_msg)
+if status_msg:
+    await safe_delete_message(status_msg)
 
-# 🔁 AUTO RESTART (1 second)
+# 🔄 AUTO RESTART (1 second after link generated)
 import os
 import asyncio
-asyncio.get_event_loop().call_later(1, lambda: os._exit(0))
+loop = asyncio.get_running_loop()
+loop.call_later(1, lambda: os._exit(0))
 
 return links
     except Exception as e:
@@ -605,5 +606,6 @@ async def process_batch(
         )
     if notification_msg:
         await safe_delete_message(notification_msg)
+
 
 
