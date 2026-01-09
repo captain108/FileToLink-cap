@@ -2,14 +2,18 @@
 
 import os
 import asyncio
+
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
+from pyrogram.types import (
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    Message,
+)
 
 from Thunder.bot import StreamBot
 from Thunder.vars import Var
 from Thunder.utils.logger import logger
 from Thunder.utils.database import db
-from Thunder.utils.tokens import generate_token
 
 
 # ==============================
@@ -20,31 +24,49 @@ from Thunder.utils.tokens import generate_token
 async def start_handler(client: Client, message: Message):
     await db.add_user(message.from_user.id)
     await message.reply_text(
-        "👋 Send me a file and I will generate a stream & download link."
+        "👋 Send me a file and I will generate stream & download links."
     )
 
 
 # ==============================
-# FILE HANDLER
+# FILE HANDLER (DOCUMENT / VIDEO / AUDIO)
 # ==============================
 
-@StreamBot.on_message(filters.private & (filters.document | filters.video | filters.audio))
+@StreamBot.on_message(
+    filters.private & (filters.document | filters.video | filters.audio)
+)
 async def process_single(client: Client, message: Message):
 
     try:
-        # generate token / hash
-        token = generate_token(message.id)
+        # --------- GET FILE & UNIQUE HASH ----------
+        if message.document:
+            file = message.document
+        elif message.video:
+            file = message.video
+        elif message.audio:
+            file = message.audio
+        else:
+            return
 
-        base_url = f"https://{Var.FQDN}" if Var.HAS_SSL else f"http://{Var.FQDN}"
+        # Thunder server validates using file_unique_id[:6]
+        secure_hash = file.file_unique_id[:6]
 
-        download_link = f"{base_url}/{token}{message.id}"
-        stream_link = f"{base_url}/watch/{token}{message.id}"
+        # --------- BASE URL ----------
+        base_url = (
+            f"https://{Var.FQDN}"
+            if Var.HAS_SSL
+            else f"http://{Var.FQDN}"
+        )
 
+        download_link = f"{base_url}/{secure_hash}{message.id}"
+        stream_link = f"{base_url}/watch/{secure_hash}{message.id}"
+
+        # --------- MESSAGE TEXT ----------
         text = (
             "✨ **Your Links are Ready!** ✨\n\n"
-            f"📥 **Download:**\n{download_link}\n\n"
-            f"▶️ **Stream:**\n{stream_link}\n\n"
-            "⏳ Links work while bot is running."
+            f"📥 **Download Link:**\n{download_link}\n\n"
+            f"▶️ **Stream Link:**\n{stream_link}\n\n"
+            "⏳ Links work while the bot is running."
         )
 
         buttons = InlineKeyboardMarkup(
@@ -54,22 +76,21 @@ async def process_single(client: Client, message: Message):
             ]
         )
 
-        # ==============================
-        # SEND LINK TO USER
-        # ==============================
-
+        # --------- SEND LINK ----------
         await message.reply_text(
             text=text,
             reply_markup=buttons,
             disable_web_page_preview=True
         )
 
-        logger.info(f"Link sent for message_id={message.id}")
+        logger.info(
+            f"Link sent | msg_id={message.id} | hash={secure_hash}"
+        )
 
         # ==============================
         # 🔁 AUTO RESTART AFTER LINK
         # ==============================
-        # This replaces manual /restart
+        # Replaces manual /restart
         # Render / Railway will auto-restart process
 
         asyncio.get_event_loop().call_later(
@@ -77,12 +98,17 @@ async def process_single(client: Client, message: Message):
         )
 
     except Exception as e:
-        logger.error(f"Error processing file: {e}", exc_info=True)
-        await message.reply_text("❌ Failed to generate link. Please try again.")
+        logger.error(
+            f"Error processing file {message.id}: {e}",
+            exc_info=True
+        )
+        await message.reply_text(
+            "❌ Failed to generate link. Please try again."
+        )
 
 
 # ==============================
-# OPTIONAL: MANUAL RESTART CMD
+# MANUAL RESTART (OPTIONAL)
 # ==============================
 
 @StreamBot.on_message(filters.command("restart") & filters.user(Var.OWNER_ID))
