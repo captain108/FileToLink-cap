@@ -447,39 +447,20 @@ async def process_single(
                     ),
                     disable_web_page_preview=True,
                     quote=True
-    )
-
-    if status_msg:
-        await safe_delete_message(status_msg)
-
-    # 🔄 AUTO RESTART (1 second after link generated)
-    import os
-    import asyncio
-    loop = asyncio.get_running_loop()
-    loop.call_later(1, lambda: os._exit(0))
-
-    return links
-
-except Exception as e:
-    logger.error(
-        f"Error processing single file for message {file_msg.id}: {e}",
-        exc_info=True
-    )
-
-    if status_msg:
-        await safe_edit_message(
-            status_msg,
-            MSG_ERROR_PROCESSING_MEDIA
-        )
-
-    await notify_own(
-        bot,
-        MSG_CRITICAL_ERROR.format(
+                )
+        if status_msg:
+            await safe_delete_message(status_msg)
+        return links
+    except Exception as e:
+        logger.error(f"Error processing single file for message {file_msg.id}: {e}", exc_info=True)
+        if status_msg:
+            await safe_edit_message(status_msg, MSG_ERROR_PROCESSING_MEDIA)
+        
+        await notify_own(bot, MSG_CRITICAL_ERROR.format(
             error=str(e),
             error_id=secrets.token_hex(6)
-        )
-    )
-    return None
+        ))
+        return None
 
 
 async def process_batch(
@@ -618,7 +599,3 @@ async def process_batch(
         )
     if notification_msg:
         await safe_delete_message(notification_msg)
-
-
-
-
