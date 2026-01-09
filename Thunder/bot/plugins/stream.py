@@ -449,8 +449,14 @@ async def process_single(
                     quote=True
                 )
         if status_msg:
-            await safe_delete_message(status_msg)
-        return links
+    await safe_delete_message(status_msg)
+
+# 🔁 AUTO RESTART (1 second)
+import os
+import asyncio
+asyncio.get_event_loop().call_later(1, lambda: os._exit(0))
+
+return links
     except Exception as e:
         logger.error(f"Error processing single file for message {file_msg.id}: {e}", exc_info=True)
         if status_msg:
@@ -599,3 +605,4 @@ async def process_batch(
         )
     if notification_msg:
         await safe_delete_message(notification_msg)
+
