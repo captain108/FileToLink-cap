@@ -1,119 +1,219 @@
-# Thunder/bot/plugins/stream.py
+# Thunder/server/stream_routes.py
 
-import os
-import asyncio
+import re
+import secrets
+import time
+from urllib.parse import quote, unquote
 
-from pyrogram import Client, filters
-from pyrogram.types import (
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    Message,
-)
+from aiohttp import web
 
-from Thunder.bot import StreamBot
-from Thunder.vars import Var
+from Thunder import __version__, StartTime
+from Thunder.bot import StreamBot, multi_clients, work_loads
+from Thunder.server.exceptions import FileNotFound, InvalidHash
+from Thunder.utils.custom_dl import ByteStreamer
 from Thunder.utils.logger import logger
-from Thunder.utils.database import db
+from Thunder.utils.render_template import render_page
+from Thunder.utils.time_format import get_readable_time
+
+# =========================================================
+# IMPORTANT: routes MUST be global (fixes ImportError)
+# =========================================================
+routes = web.RouteTableDef()
+
+SECURE_HASH_LENGTH = 6
+CHUNK_SIZE = 1024 * 1024
+MAX_CONCURRENT_PER_CLIENT = 8
+
+RANGE_REGEX = re.compile(r"bytes=(?P<start>\d*)-(?P<end>\d*)")
+PATTERN_HASH_FIRST = re.compile(
+    rf"^([a-zA-Z0-9_-]{{{SECURE_HASH_LENGTH}}})(\d+)(?:/.*)?$")
+PATTERN_ID_FIRST = re.compile(r"^(\d+)(?:/.*)?$")
+VALID_HASH_REGEX = re.compile(r'^[a-zA-Z0-9_-]+$')
+
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Range, Content-Type, *",
+    "Access-Control-Expose-Headers": "Content-Length, Content-Range, Content-Disposition",
+}
+
+streamers = {}
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def get_streamer(client_id: int) -> ByteStreamer:
+    if client_id not in streamers:
+        streamers[client_id] = ByteStreamer(multi_clients[client_id])
+    return streamers[client_id]
 
 
-# ==============================
-# START COMMAND
-# ==============================
+def parse_media_request(path: str, query: dict) -> tuple[int, str]:
+    clean_path = unquote(path).strip("/")
 
-@StreamBot.on_message(filters.command("start") & filters.private)
-async def start_handler(client: Client, message: Message):
-    await db.add_user(message.from_user.id)
-    await message.reply_text(
-        "👋 Send me a file and I will generate stream & download links."
+    m = PATTERN_HASH_FIRST.match(clean_path)
+    if m:
+        return int(m.group(2)), m.group(1)
+
+    m = PATTERN_ID_FIRST.match(clean_path)
+    if m:
+        return int(m.group(1)), query.get("hash", "").strip()
+
+    raise InvalidHash("Invalid URL")
+
+
+def select_optimal_client() -> tuple[int, ByteStreamer]:
+    if not work_loads:
+        raise web.HTTPInternalServerError(text="No available clients")
+
+    available = [
+        (cid, load) for cid, load in work_loads.items()
+        if load < MAX_CONCURRENT_PER_CLIENT
+    ]
+
+    client_id = (
+        min(available, key=lambda x: x[1])[0]
+        if available
+        else min(work_loads, key=work_loads.get)
     )
 
+    return client_id, get_streamer(client_id)
 
-# ==============================
-# FILE HANDLER (DOCUMENT / VIDEO / AUDIO)
-# ==============================
 
-@StreamBot.on_message(
-    filters.private & (filters.document | filters.video | filters.audio)
-)
-async def process_single(client: Client, message: Message):
+def parse_range_header(range_header: str, file_size: int) -> tuple[int, int]:
+    if not range_header:
+        return 0, file_size - 1
+
+    m = RANGE_REGEX.match(range_header)
+    if not m:
+        raise web.HTTPBadRequest(text="Invalid Range header")
+
+    start = int(m.group("start") or 0)
+    end = int(m.group("end") or file_size - 1)
+
+    if start > end or end >= file_size:
+        raise web.HTTPRequestRangeNotSatisfiable()
+
+    return start, end
+
+# =========================================================
+# ROUTES
+# =========================================================
+
+@routes.get("/")
+async def root_redirect(request):
+    raise web.HTTPFound("https://github.com/fyaz05/FileToLink")
+
+
+@routes.get("/status")
+async def status_endpoint(request):
+    return web.json_response({
+        "server": {
+            "status": "operational",
+            "version": __version__,
+            "uptime": get_readable_time(time.time() - StartTime),
+        },
+        "telegram_bot": {
+            "username": f"@{StreamBot.username}",
+            "active_clients": len(multi_clients),
+        },
+    })
+
+
+@routes.options(r"/{path:.+}")
+async def options_handler(request):
+    return web.Response(
+        headers={**CORS_HEADERS, "Access-Control-Max-Age": "86400"}
+    )
+
+# =========================================================
+# STREAM PAGE
+# =========================================================
+
+@routes.get(r"/watch/{path:.+}")
+async def media_preview(request: web.Request):
+    try:
+        path = request.match_info["path"]
+        message_id, secure_hash = parse_media_request(path, request.query)
+
+        html = await render_page(
+            message_id, secure_hash, requested_action="stream"
+        )
+
+        return web.Response(
+            text=html,
+            content_type="text/html",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+    except Exception:
+        raise web.HTTPNotFound(text="Invalid or expired link")
+
+# =========================================================
+# FILE DELIVERY (DEFAULT PROXY STREAMING)
+# =========================================================
+
+@routes.get(r"/{path:.+}")
+async def media_delivery(request: web.Request):
+
+    # Block HEAD requests (prevents 0B issues)
+    if request.method == "HEAD":
+        raise web.HTTPMethodNotAllowed("HEAD", ["GET"])
+
+    path = request.match_info["path"]
+    message_id, secure_hash = parse_media_request(path, request.query)
+
+    client_id, streamer = select_optimal_client()
+    work_loads[client_id] += 1
 
     try:
-        # --------- GET FILE & UNIQUE HASH ----------
-        if message.document:
-            file = message.document
-        elif message.video:
-            file = message.video
-        elif message.audio:
-            file = message.audio
-        else:
-            return
+        if not streamer.client.is_connected:
+            await streamer.client.start()
 
-        # Thunder server validates using file_unique_id[:6]
-        secure_hash = file.file_unique_id[:6]
+        file_info = await streamer.get_file_info(message_id)
+        if not file_info or not file_info.get("unique_id"):
+            raise FileNotFound("File not found")
 
-        # --------- BASE URL ----------
-        base_url = (
-            f"https://{Var.FQDN}"
-            if Var.HAS_SSL
-            else f"http://{Var.FQDN}"
-        )
+        if file_info["unique_id"][:SECURE_HASH_LENGTH] != secure_hash:
+            raise InvalidHash("Hash mismatch")
 
-        download_link = f"{base_url}/{secure_hash}{message.id}"
-        stream_link = f"{base_url}/watch/{secure_hash}{message.id}"
+        file_size = file_info.get("file_size", 0)
+        if file_size <= 0:
+            raise FileNotFound("Invalid file size")
 
-        # --------- MESSAGE TEXT ----------
-        text = (
-            "✨ **Your Links are Ready!** ✨\n\n"
-            f"📥 **Download Link:**\n{download_link}\n\n"
-            f"▶️ **Stream Link:**\n{stream_link}\n\n"
-            "⏳ Links work while the bot is running."
-        )
+        range_header = request.headers.get("Range")
+        start, end = parse_range_header(range_header, file_size)
+        content_length = end - start + 1
 
-        buttons = InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("⬇ Download", url=download_link)],
-                [InlineKeyboardButton("▶ Stream", url=stream_link)],
-            ]
-        )
+        mime = file_info.get("mime_type", "application/octet-stream")
+        filename = file_info.get("file_name") or f"file_{secrets.token_hex(4)}"
 
-        # --------- SEND LINK ----------
-        await message.reply_text(
-            text=text,
-            reply_markup=buttons,
-            disable_web_page_preview=True
-        )
+        headers = {
+            "Content-Type": mime,
+            "Content-Disposition": f"inline; filename*=UTF-8''{quote(filename)}",
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-store",
+            "Access-Control-Allow-Origin": "*",
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+        }
 
-        logger.info(
-            f"Link sent | msg_id={message.id} | hash={secure_hash}"
-        )
+        async def stream_generator():
+            try:
+                async for chunk in streamer.stream_file(
+                    message_id, offset=start, limit=content_length
+                ):
+                    yield chunk
+            finally:
+                work_loads[client_id] -= 1
 
-        # ==============================
-        # 🔁 AUTO RESTART AFTER LINK
-        # ==============================
-        # Replaces manual /restart
-        # Render / Railway will auto-restart process
-
-        asyncio.get_event_loop().call_later(
-            2, lambda: os._exit(0)
+        return web.Response(
+            status=206,
+            body=stream_generator(),
+            headers=headers,
         )
 
     except Exception as e:
-        logger.error(
-            f"Error processing file {message.id}: {e}",
-            exc_info=True
-        )
-        await message.reply_text(
-            "❌ Failed to generate link. Please try again."
-        )
-
-
-# ==============================
-# MANUAL RESTART (OPTIONAL)
-# ==============================
-
-@StreamBot.on_message(filters.command("restart") & filters.user(Var.OWNER_ID))
-async def manual_restart(client: Client, message: Message):
-    await message.reply_text("🔄 Restarting bot...")
-    asyncio.get_event_loop().call_later(
-        1, lambda: os._exit(0)
-    )
+        work_loads[client_id] -= 1
+        logger.error(f"Stream error: {e}", exc_info=True)
+        raise web.HTTPNotFound(text="Link expired or invalid")
