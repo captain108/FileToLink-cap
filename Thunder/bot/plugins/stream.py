@@ -449,7 +449,7 @@ async def process_single(
                     quote=True
                 )
         if status_msg:
-    await safe_delete_message(status_msg)
+            await safe_delete_message(status_msg)
 
 # 🔁 AUTO RESTART (1 second)
 import os
@@ -605,4 +605,5 @@ async def process_batch(
         )
     if notification_msg:
         await safe_delete_message(notification_msg)
+
 
